@@ -157,3 +157,24 @@ Not pursuing: **#3** (does not reproduce under the installed SQLAlchemy version 
 **The root cause:** Python's `date.weekday()` returns `6` for Sunday (Monday=0 ... Sunday=6). The increment branch in `update_listening_streak()` (`services/streak_service.py`) was gated by `days_since_last == 1 and today.weekday() != 6`, so whenever "today" happened to be a Sunday, this condition evaluated to `False` even though the user listened on a consecutive day — the code fell through to the `else` branch and reset the streak to 1 instead of incrementing it. There is no documented rule that Sundays should behave differently; the weekday check is simply an erroneous condition with no legitimate purpose.
 
 **Fix and side-effect check:** Removed the `and today.weekday() != 6` clause, so the branch now reads `elif days_since_last == 1:`. Verified: `pytest tests/test_streaks.py` now shows 5/5 passing (previously 4/5). Explicitly checked both sides of the boundary this bug touched — Saturday→Sunday (the failing case, now correctly increments 5→6) and Sunday→Monday (already worked before the fix, confirmed it still does, now 3→4). Ran the full `pytest tests/` suite: 13/13 passing.
+
+### Issue #4: I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it:** Drove the app over HTTP. Checked `GET /users/<simone_id>/notifications` (`count: 0`), then had a friend (`nova`, not the song's sharer) call `POST /songs/<song_id>/rate` on a song `simone` shared — got back a `201` with a valid `Rating` object, confirming the rating itself succeeded. Checked `GET /users/<simone_id>/notifications` again — still `count: 0`. No existing automated test covers this (there's no `test_notifications.py`), so this was purely a manual repro.
+
+**How I found the root cause:** Per the hint, compared `rate_song()` line-by-line against `add_to_playlist()` in the same file (`services/notification_service.py`), since both represent "a friend interacted with your shared song" and `add_to_playlist()` is the one that already works. `add_to_playlist()` follows a clear pattern: mutate state, then call `create_notification(user_id=song.shared_by, ...)` guarded by `if song.shared_by != added_by_user_id` so the sharer doesn't get notified about their own action. `rate_song()` mutates state (creates/updates the `Rating`, commits) but the function simply ends there — there's no `create_notification()` call anywhere in it.
+
+**The root cause:** This is architectural, not a typo, as the hint suggested — `rate_song()` was never given the notify step that every other "friend interacted with your song" action follows. The notification-creation call was omitted entirely from the function, not miswired or misconfigured.
+
+**Fix and side-effect check:** Added, after the existing `db.session.commit()` in `rate_song()`:
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+    )
+```
+This mirrors `add_to_playlist()`'s guard so a user rating their own shared song does not self-notify. Verified via HTTP: `darius` rating `simone`'s song took her notification count from 0 → 1 with a correct `song_rated` body; `simone` then rating her *own* song left the count unchanged (self-notify guard confirmed). Re-verified `add_to_playlist()`'s pre-existing notification path still fires correctly and is unaffected by this change (`kenji` re-adding an already-playlisted song still notified `darius`, the sharer). Ran the full `pytest tests/` suite: 13/13 passing (no regressions; no existing tests cover notifications either way).
+
+**Aside (out of scope):** while verifying, `POST /playlists/<id>/songs` for a song *not already in the playlist* threw a `500` (`IntegrityError: NOT NULL constraint failed: playlist_entries.position`) — `add_to_playlist()`'s `playlist.songs.append(song)` doesn't populate the `position`/`added_by` columns that `playlist_entries` requires beyond the two FK columns. This is a real, pre-existing bug (confirmed unrelated to any of my changes), but it isn't one of the 5 tracked issues, so I left it as-is rather than fixing it in scope.
